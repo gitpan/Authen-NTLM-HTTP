@@ -1,0 +1,5 @@
+MANIFEST
+README
+Makefile.PL
+lib/Authen/NTLM/HTTP.pm
+t/HTTP.t
