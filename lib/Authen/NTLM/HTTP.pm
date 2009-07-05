@@ -13,14 +13,13 @@ use MIME::Base64;
 use vars qw($VERSION @ISA @EXPORT @EXPORT_OK);
 
 require Exporter;
-require DynaLoader;
 
 *import = \&Exporter::import;
 
-@ISA = qw (Exporter DynaLoader Authen::NTLM);
+use base qw/Authen::NTLM::HTTP::Base/;
 @EXPORT = qw ();
 @EXPORT_OK = qw ();
-$VERSION = '0.02';
+$VERSION = '0.32';
 
 # Stolen from Crypt::DES.
 sub usage {
@@ -29,6 +28,10 @@ sub usage {
     croak "Usage: $subr (@_)";
 }
 
+# Flags to indicate whether we are talking to web server or proxy
+use constant NTLMSSP_HTTP_WWW => "WWW";
+use constant NTLMSSP_HTTP_PROXY => "Proxy";
+
 # These constants are stolen from samba-2.2.4 and other sources
 use constant NTLMSSP_SIGNATURE => 'NTLMSSP';
 
@@ -36,18 +39,18 @@ use constant NTLMSSP_SIGNATURE => 'NTLMSSP';
 use constant NTLMSSP_NEGOTIATE => 1;
 use constant NTLMSSP_CHALLENGE => 2;
 use constant NTLMSSP_AUTH      => 3;
-use constant NTLMSSP_UNKNOWN   => 4; 
+use constant NTLMSSP_UNKNOWN   => 4;
 
 # NTLMSSP Flags
 
 # Text strings are in unicode
 use constant NTLMSSP_NEGOTIATE_UNICODE                  => 0x00000001;
-# Text strings are in OEM 
+# Text strings are in OEM
 use constant NTLMSSP_NEGOTIATE_OEM                      => 0x00000002;
-# Server should return its authentication realm 
+# Server should return its authentication realm
 use constant NTLMSSP_REQUEST_TARGET                     => 0x00000004;
-# Request signature capability 
-use constant NTLMSSP_NEGOTIATE_SIGN                     => 0x00000010; 
+# Request signature capability
+use constant NTLMSSP_NEGOTIATE_SIGN                     => 0x00000010;
 # Request confidentiality
 use constant NTLMSSP_NEGOTIATE_SEAL                     => 0x00000020;
 # Use datagram style authentication
@@ -92,9 +95,10 @@ use constant NTLMSSP_NEGOTIATE_80000000                 => 0x80000000;
 # and the LM hash of the client password as arguments.                  #
 #########################################################################
 sub new_client {
-    usage("new_client Authen::NTLM::HTTP(\$lm_hpw, \$nt_hpw\) or\nnew_client Authen::NTLM::HTTP\(\$lm_hpw, \$nt_hpw, \$user, \$user_domain, \$domain, \$machine\)") unless @_ == 3 or @_ == 7;
-    my ($package, $lm_hpw, $nt_hpw, $user, $user_domain, $domain, $machine) = @_;
+    usage("new_client Authen::NTLM::HTTP(\$lm_hpw, \$nt_hpw\) or\nnew_client Authen::NTLM::HTTP\(\$lm_hpw, \$nt_hpw, \$type, \$user, \$user_domain, \$domain, \$machine\)") unless @_ == 3 or @_ == 4 or @_ == 8;
+    my ($package, $lm_hpw, $nt_hpw, $type, $user, $user_domain, $domain, $machine) = @_;
     srand time;
+    if (not defined($type)) {$type = NTLMSSP_HTTP_WWW;}
     if (not defined($user)) {$user = $ENV{'USERNAME'};}
     if (not defined($user_domain)) {$user_domain = $ENV{'USERDOMAIN'};}
     if (not defined($domain)) {$domain = Win32::DomainName();}
@@ -107,6 +111,7 @@ sub new_client {
     defined($machine) or usage "Undefined Computer Name!\n";
     my $ctx_id = pack("V", rand 2**32);
     bless {
+	'type' => $type,
 	'user' => $user,
 	'user_domain' => $user_domain,
 	'domain' => $domain,
@@ -122,11 +127,13 @@ sub new_client {
 # is not supplied, it will call Win32::DomainName to obtain it.           #
 ###########################################################################
 sub new_server {
-    usage("new_server Authen::NTLM::HTTP or\nnew_server Authen::NTLM::HTTP(\$domain\)") unless @_ == 1 or @_ == 2;
-    my ($package, $domain) = @_;
+    usage("new_server Authen::NTLM::HTTP or\nnew_server Authen::NTLM::HTTP(\$type, \$domain\)") unless @_ == 1 or @_ == 2 or @_ == 3;
+    my ($package, $type, $domain) = @_;
+    if (not defined($type)) {$type = NTLMSSP_HTTP_WWW;}
     if (not defined($domain)) {$domain = Win32::DomainName();}
     defined($domain) or usage "Undefined Network Domain!\n";
     bless {
+	'type' => $type,
         'domain' => $domain,
 	'cChallenge' => 0 # a counter to stir the seed to generate random
           }, $package;    # number for the nonce
@@ -151,7 +158,7 @@ sub http_negotiate($$)
 # http_parse_negotiate parses the NTLM-over-HTTP negotiate tag line and   #
 # return a list of NTLM Negotiation Flags, Server Network Domain and      #
 # Machine name of the client.                                             #
-########################################################################### 
+###########################################################################
 sub http_parse_negotiate($$)
 {
     my ($self, $pkt) = @_;
@@ -162,7 +169,7 @@ sub http_parse_negotiate($$)
 
 ####################################################################
 # http_challenge composes the NTLM-over-HTTP challenge tag line. It#
-# takes NTLM Negotiation Flags as an argument.                     # 
+# takes NTLM Negotiation Flags as an argument.                     #
 ####################################################################
 sub http_challenge($$)
 {
@@ -178,19 +185,20 @@ sub http_challenge($$)
 	$str = encode_base64($self->SUPER::challenge_msg($flags));
     }
     $str =~ s/\s//g;
-    return "WWW-Authenticate: NTLM " . $str;
+    return $self->{'type'} . "-Authenticate: NTLM " . $str;
 }
 
 ###########################################################################
 # http_parse_challenge parses the NTLM-over-HTTP challenge tag line and   #
 # return a list of server network domain, NTLM Negotiation Flags, Nonce,  #
 # ServerContextHandleUpper and ServerContextHandleLower.                  #
-########################################################################### 
+###########################################################################
 sub http_parse_challenge
 {
     my ($self, $pkt) = @_;
-    $pkt =~ s/WWW-Authenticate: NTLM //;
-    my $str = decode_base64($pkt);
+    my $str = $self->{'type'} . "-Authenticate: NTLM ";
+    $pkt =~ s/$str//;
+    $str = decode_base64($pkt);
     return $self->SUPER::parse_challenge($str);
 }
 
@@ -208,18 +216,28 @@ sub http_auth($$$)
     my $flags = shift;
     my $str = encode_base64($self->SUPER::auth_msg($nonce, $flags));
     $str =~ s/\s//g;;
-    return "Authorization: NTLM " . $str;
+    if ($self->{'type'} eq NTLMSSP_HTTP_PROXY) {
+	return "Proxy-Authorization: NTLM " . $str;
+    }
+    else {
+	return "Authorization: NTLM " . $str;
+    }
 }
 
 ###########################################################################
 # http_parse_auth parses the NTLM-over-HTTP authentication tag line and   #
 # return a list of NTLM Negotiation Flags, LM response, NT response, User #
 # Domain, User Name, User Machine Name and Session Key.                   #
-########################################################################### 
+###########################################################################
 sub http_parse_auth($$)
 {
     my ($self, $pkt) = @_;
-    $pkt =~ s/Authorization: NTLM //;
+    if ($self->{'type'} eq NTLMSSP_HTTP_PROXY) {
+        $pkt =~ s/Proxy-Authorization: NTLM //;
+    }
+    else {
+	$pkt =~ s/Authorization: NTLM //;
+    }
     my $str = decode_base64($pkt);
     return $self->SUPER::parse_auth($str);
 }
@@ -241,27 +259,27 @@ Stage 1: Client requests a web page.
     1: C  --> S   GET ...
 
 Stage 2: Server responds and says the client needs to authenticate in NTLM manner.
-    
+
     2: C <--  S   401 Unauthorized
                   WWW-Authenticate: NTLM
 
 Stage 3: Client responds with NTLM negotiate message that contains the identity and the domain of the client.
-    
+
     3: C  --> S   GET ...
                   Authorization: NTLM <base64-encoded type-1-message>
-    
+
 Stage 4: Server challenges the client with a 8-bytes random number in the NTLM challenge message.
 
     4: C <--  S   401 Unauthorized
                   WWW-Authenticate: NTLM <base64-encoded type-2-message>
 
 Stage 5: Client responds with a reply that uses its password to encrypt the 8-bytes random number.
-    
+
     5: C  --> S   GET ...
                   Authorization: NTLM <base64-encoded type-3-message>
-   
+
 Stage 6: Authentication success. Server replies with the web page.
- 
+
     6: C <--  S   200 Ok
 
 =head1 SYNOPSIS
@@ -270,6 +288,8 @@ use Authen::NTLM (nt_hash lm_hash);
 use Authen::NTLM::HTTP;
 
     $my_pass = "mypassword";
+# Note: To instantiate a client talking to a proxy, do
+# $client = new_client Authen::NTLM::HTTP(lm_hash($my_pass), nt_hash($my_pass), Authen::NTLM::HTTP::NTLMSSP_HTTP_PROXY);
     $client = new_client Authen::NTLM::HTTP(lm_hash($my_pass), nt_hash($my_pass));
 
 # Stage 3 scenario: creates NTLM negotiate message and then
@@ -292,9 +312,11 @@ use Authen::NTLM::HTTP;
 
 # To instantiate a server to parse a NTLM negotiation
 # and compose a NTLM challenge
+# Note: To instantiate a proxy, do
+# $server = new_server Authen::NTLM::HTTP(Authen::NTLM::HTTP::NTLMSSP_HTTP_PROXY);
     $server = new_server Authen::NTLM::HTTP;
 
-    ($flags, $domain, $machine) = 
+    ($flags, $domain, $machine) =
 	$server->http_parse_negotiate($negotiate_msg);
 
     $flags = Authen::NTLM::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
@@ -308,7 +330,7 @@ use Authen::NTLM::HTTP;
 # Then use nonce to compose reply with http_auth
 
 # client parse NTLM challenge
-    ($domain, $flags, $nonce, $ctx_upper, $ctx_lower) = 
+    ($domain, $flags, $nonce, $ctx_upper, $ctx_lower) =
 	$client->http_parse_challenge($challenge_msg);
 
 # To compose a NTLM Response Packet
@@ -325,42 +347,19 @@ use Authen::NTLM::HTTP;
     ($flags, $lm_resp, $nt_resp, $user_domain, $username, $machine) =
 	$server->http_parse_auth($auth_msg);
 
-=head1 DESCRIPTION
+=head1 SEE ALSO
 
-This is an extension of the Authen::NTLM module written by 
-Yee Man Chan. It was written due to popular requests. 
-Yee Man Chan never tests it in any production environment
-but he is confident that it should work as expected.
-
-=head1 DEPENDENCIES
-
-To use this module, please install the following two modules:
-
-1) Authen::NTLM module by Yee Man Chan (UMVUE)
-
-2) MIME::Base64 module by Gisle Aas (GAAS).
-
-
-=head1 TO-DO
-
-Supposedly this implementation is complete. Improvements will be done
-on the underlying Authen::NTLM module. However, if you figure out
-something I missed, feel free to let me know.
-
-=head1 BUGS
-
-Nothing known. 
+Authen::NTLM(3), MIME::Base64(3), perl(1), m4(1).
 
 =head1 AUTHOR
 
 This implementation was written by Yee Man Chan (ymc@yahoo.com).
-Copyright (c) 2002 Yee Man Chan. All rights reserved. This program 
-is free software; you can redistribute it and/or modify it under 
-the same terms as Perl itself. 
+Copyright (c) 2002 Yee Man Chan. Some rights reserved.
 
-=head1 SEE ALSO
+=head1 LICENSE
 
-Authen::NTLM(3), MIME::Base64(3), perl(1), m4(1).
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself.
 
 =cut
 
@@ -373,4 +372,4 @@ perl-brace-offset: -4
 perl-brace-imaginary-offset: 0
 perl-label-offset: -4
 tab-width: 4
-End:                                                                            
+End:
